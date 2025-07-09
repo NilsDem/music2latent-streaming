@@ -1,38 +1,33 @@
 # MAIN PARAMETERS
-batch_size = 16                                                             # batch size
+batch_size = 8                                                              # batch size
 lr = 0.0001                                                                 # learning rate
-total_iters = 800000                                                        # total iterations
+total_iters = 1000000                                                        # total iterations
 iters_per_epoch = 10000                                                     # number of iterations approximately in every epoch
 compile_model = True                                                        # compile the model for faster training (will require ~10 minutes of compilation time only on first run)
-num_workers = 16                                                            # number of dataloader workers
+num_workers = 16                                                   # number of dataloader workers
 multi_gpu = False                                                           # use DistributedDataParallel multi-gpu training, to be used with torchrun
 
-data_paths = ['/media/datasets/dataset1', '/media/datasets/dataset2']       # list of paths of training datasets (use a single-element list for a single dataset). Audio files will be recursively searched in these paths and in their sub-paths
+data_paths = None#['/data/nils/datasets/drums']       # list of paths of training datasets (use a single-element list for a single dataset). Audio files will be recursively searched in these paths and in their sub-paths
+db_paths = ["/data/nils/datasets/jamendo/audio_44k"]#, "/data/nils/datasets/drums/export/expended_gmd/audio_44k", "/data/nils/datasets/drums/export/darbouka/audio_44k","/data/nils/datasets/drums/export/breaks/audio_44k","/data/nils/datasets/electronic/canblast/audio_44k", "/data/nils/datasets/music_dataset_copy/lofi/", "/data/nils/datasets/music_dataset_copy/rock/","/data/nils/datasets/music_dataset_copy/dub/", "/data/nils/datasets/music_dataset_copy/jazz/","/data/nils/datasets/raw/audio_44k","/data/nils/datasets/instruments/export/maestro-v3.0.0/", "/data/nils/datasets/instruments/export/slakh/", "/data/nils/datasets/instruments/export/violin/", "/data/nils/datasets/instruments/export/guitarset","/data/nils/datasets/electronic/techno_dataset_v2/audio_44k"] # 
 data_fractions = None                                                       # list of sampling weights of each dataset (if None, equal sampling weights)
-data_path_test = '/media/datasets/test_dataset'                             # path of samples used for FAD testing (e.g. musiccaps)
-data_extensions = ['.wav', '.flac']                                         # list of extensions of audio files to search for in the given paths
+data_path_test = '/data/nils/datasets/jamendo/audio/00'                             # path of samples used for FAD testing (e.g. musiccaps)
+data_extensions = ['.wav', '.flac', '.mp3']                                         # list of extensions of audio files to search for in the given paths
 
-num_samples_fad = 500                                                       # number of samples that are encoded and decoded for FAD evaluation
-
-
-
-
-
-
+num_samples_fad = 300                                                       # number of samples that are encoded and decoded for FAD evaluation
 
 
 # TRAINING
 lr_decay = 'cosine'                                                         # learning rate schedule ['cosine', 'linear', 'inverse_sqrt]    
 start_decay_iteration = 0                                                   # start decaying learning rate from this iteration
-final_lr = 0.000001                                                         # if exponential_lr_decay=True, this is the learning rate after total_iters
+final_lr = 0.00001                                                         # if exponential_lr_decay=True, this is the learning rate after total_iters
 warmup_steps = iters_per_epoch                                              # number of warmup steps of optimizer
 accumulate_gradients = 1                                                    # will accumulate the gradients from this number of batches befire updating
 checkpoint_path = 'checkpoints'                                             # path where to save config and checkpoints
-torch_compile_cache_dir = 'tmp/torch_compile'                               # path where to save compiled kernels
+torch_compile_cache_dir = 'tmp/torch_compile_base_nostream'                               # path where to save compiled kernels
 mixed_precision = True                                                      # use mixed precision (float16)
 seed = 42                                                                   # seed for Pytorch and Numpy
 
-load_path = None                                                            # load checkpoint from this path 
+load_path =  None#"/data/nils/repos/codecs_benchmark/music2latent/checkpoints/2025-06-06 18:58:18.986340/model_fid_40.091296897246224_loss_96.417_iters_82310.pt"                                                          # load checkpoint from this path 
 load_iter = True                                                            # if False, reset the scheduler and start from iteration 0
 load_ema = True                                                             # if False, do not load the EMA weights from checkpoint
 load_optimizer = True                                                       # if False, do not load the optimizer parameters from checkpoint (helps in case of resuming collapsed run)
@@ -50,11 +45,11 @@ warmup_ema = True                                                           # us
 rms_min = 0.001                                                             # minimum RMS value for audio samples used for training
 
 data_channels = 2                                                           # channels of input data (real-imaginary STFT requires 2)
-data_length = 64                                                            # sequence length of input spectrogram
-data_length_test = 1024//4                                                  # sequence length of spectrograms used for testing
+data_length = 128                                                            # sequence length of input spectrogram
+data_length_test = 256                                                  # sequence length of spectrograms used for testing
 sample_rate = 44100                                                         # sampling rate used to render audio samples (does not matter for training)
 
-hop = 128*4                                                                 # hop size of STFT
+hop = 128*4                                                            # hop size of STFT
 
 alpha_rescale = 0.65                                                        # alpha rescale parameter for STFT representation
 beta_rescale = 0.34                                                         # beta rescale parameter for STFT representation
@@ -72,7 +67,8 @@ fad_background_embeddings = [f'fad_stats/{data_path_test.replace("/", "")}_{fm}.
 
 
 # MODEL
-base_channels = 64                                                          # base channel number for architecture
+conv_mode = "normal"
+base_channels = 64                                                        # base channel number for architecture
 layers_list = [2,2,2,2,2]                                                   # number of blocks per each resolution level
 multipliers_list = [1,2,4,4,4]                                              # base channels multipliers for each resolution level
 attention_list = [0,0,1,1,1]                                                # for each resolution, 0 if no attention is performed, 1 if attention is performed
@@ -83,6 +79,8 @@ attention_list_encoder = [0,0,1,1,1]                                        # fo
 bottleneck_base_channels = 512                                              # base channels to use for block before/after bottleneck
 num_bottleneck_layers = 4                                                   # number of blocks to use before/after bottleneck
 frequency_scaling = True                                                    # use frequency scaling
+
+
 
 heads = 4                                                                   # number of attention heads
 cond_channels = 256                                                         # dimension of time embedding
@@ -103,7 +101,7 @@ pre_normalize_downsampling_encoder = True                                   # pr
 schedule = 'exponential'                                                    # step schedule to use ['constant', 'exponential']
 
 start_exp = 1.                                                              # if schedule is 'exponential', the starting exponent
-end_exp = 3.                                                                # the higher the exponent, the smaller the steps at the end of training or throughout training if schedule is 'constant'
+end_exp = 2.                                                                # the higher the exponent, the smaller the steps at the end of training or throughout training if schedule is 'constant'
 base_step = 0.1                                                             # the base step on which the exponent is applied
 
 sigma_min = 0.002                                                           # minimum sigma for EDM framework

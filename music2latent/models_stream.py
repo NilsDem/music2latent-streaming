@@ -5,7 +5,9 @@ from .audio import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Optional
+from .cached_conv_2d import CachedConv2d, CachedGroupNorm
+import cached_conv as cc
 
 def zero_init(module):
     if hparams.init_as_zero:
@@ -14,13 +16,13 @@ def zero_init(module):
     return module
 
 def upsample_1d(x):
-    return F.interpolate(x, scale_factor=2, mode="nearest")
+    return F.interpolate(x, scale_factor=2., mode="nearest")
 
 def downsample_1d(x):
     return F.avg_pool1d(x, kernel_size=2, stride=2)
 
 def upsample_2d(x):
-    return F.interpolate(x, scale_factor=2, mode="nearest")
+    return F.interpolate(x, scale_factor=2., mode="nearest")
 
 def downsample_2d(x):
     return F.avg_pool2d(x, kernel_size=2, stride=2)
@@ -57,17 +59,18 @@ class UpsampleConv(nn.Module):
             out_channels = in_channels
         
         if normalize:
-            self.norm = nn.GroupNorm(min(in_channels//4, 32), in_channels)
+            self.norm = CachedGroupNorm(min(in_channels//4, 32), in_channels)
+        else:
+            self.norm = nn.Identity()
 
         if use_2d:
-            self.c = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding='same')
+            self.c = CachedConv2d(in_channels, out_channels, kernel_size=3, stride=1, padding_vert = "same", padding_time = cc.get_padding(kernel_size = 3, stride=1, mode = hparams.conv_mode))
         else:
-            self.c = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=1, padding='same')
+            self.c = CachedConv2d(in_channels, out_channels, kernel_size=3, stride=1, padding_vert = "same", padding_time = cc.get_padding(kernel_size = 3, stride=1, mode = hparams.conv_mode))
 
-    def forward(self, x):
+    def forward(self, x, time_emb: Optional[torch.Tensor]):
 
-        if self.normalize:
-            x = self.norm(x)
+        x = self.norm(x)
         
         if self.use_2d:
             x = upsample_2d(x)
@@ -86,23 +89,24 @@ class DownsampleConv(nn.Module):
             out_channels = in_channels
         
         if normalize:
-            self.norm = nn.GroupNorm(min(in_channels//4, 32), in_channels)
+            self.norm = CachedGroupNorm(min(in_channels//4, 32), in_channels)
+        else:
+            self.norm= nn.Identity()
 
         if use_2d:
-            self.c = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+            self.c = CachedConv2d(in_channels, out_channels, kernel_size=3, stride=2, padding_vert = "same", padding_time = cc.get_padding(kernel_size = 3, stride=2, mode = hparams.conv_mode))
         else:
-            self.c = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+            self.c = cc.Conv1d(in_channels, out_channels, kernel_size=3, stride=2, padding = cc.get_padding(kernel_size = 3, stride=2, mode = hparams.conv_mode))
 
-    def forward(self, x):
+    def forward(self, x, time_emb: Optional[torch.Tensor] = None):
         
-        if self.normalize:
-            x = self.norm(x)
+        x = self.norm(x)
         x = self.c(x)
 
         return x
 
 class UpsampleFreqConv(nn.Module):
-    def __init__(self, in_channels, out_channels=None, normalize=False):
+    def __init__(self, in_channels, out_channels=None, normalize=False, stride=4):
         super(UpsampleFreqConv, self).__init__()
         self.normalize = normalize
 
@@ -110,19 +114,21 @@ class UpsampleFreqConv(nn.Module):
             out_channels = in_channels
 
         if normalize:
-            self.norm = nn.GroupNorm(min(in_channels//4, 32), in_channels)
+            self.norm = CachedGroupNorm(min(in_channels//4, 32), in_channels)
+    
+        else:
+            self.norm = nn.Identity()
         
-        self.c = nn.Conv2d(in_channels, out_channels, kernel_size=(5,1), stride=1, padding='same')
-
-    def forward(self, x):
-        if self.normalize:
-            x = self.norm(x)
-        x = F.interpolate(x, scale_factor=(4,1), mode="nearest")
+        self.c = CachedConv2d(in_channels, out_channels, kernel_size=(5,1), stride=1, padding_vert = "same", padding_time = 0)
+        self.stride = float(stride)
+    def forward(self, x, time_emb: Optional[torch.Tensor]):
+        x = self.norm(x)
+        x = F.interpolate(x, scale_factor=(self.stride,1.), mode="nearest")
         x = self.c(x)
         return x
 
 class DownsampleFreqConv(nn.Module):
-    def __init__(self, in_channels, out_channels=None, normalize=False):
+    def __init__(self, in_channels, out_channels=None, normalize=False, stride = 4):
         super(DownsampleFreqConv, self).__init__()
         self.normalize = normalize
 
@@ -130,13 +136,15 @@ class DownsampleFreqConv(nn.Module):
             out_channels = in_channels
 
         if normalize:
-            self.norm = nn.GroupNorm(min(in_channels//4, 32), in_channels)
+            self.norm = CachedGroupNorm(min(in_channels//4, 32), in_channels)
+        else:
+            self.norm = nn.Identity()
 
-        self.c = nn.Conv2d(in_channels, out_channels, kernel_size=(5,1), stride=(4,1), padding=(2,0))
+        self.c = CachedConv2d(in_channels, out_channels, kernel_size=(int(stride+1),1), stride=(stride,1), padding_vert = "same", padding_time = 0)
 
-    def forward(self, x):
-        if self.normalize:
-            x = self.norm(x)
+    def forward(self, x, time_emb : Optional[torch.Tensor]= None):
+        # if self.normalize:
+        x = self.norm(x)
         x = self.c(x)
         return x
     
@@ -154,7 +162,9 @@ class Attention(nn.Module):
         
         self.mha = MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=0.0, add_zero_attn=False, batch_first=True)
         if normalize:
-            self.norm = nn.GroupNorm(min(dim//4, 32), dim)
+            self.norm = CachedGroupNorm(min(dim//4, 32), dim)
+        else:
+            self.norm = nn.Identity()
 
     def forward(self, x):
         
@@ -163,23 +173,96 @@ class Attention(nn.Module):
         if self.normalize:
             x = self.norm(x)
         
+        
         if self.use_2d:
             x = x.permute(0,3,2,1) # shape: [bs,len,freq,channels]
-            bs,len,freq,channels = x.shape[0],x.shape[1],x.shape[2],x.shape[3]
-            x = x.reshape(bs*len,freq,channels) # shape: [bs*len,freq,channels]
+            bs,length,freq,channels = x.shape[0],x.shape[1],x.shape[2],x.shape[3]
+            x = x.reshape(bs*length,freq,channels) # shape: [bs*len,freq,channels]
         else:
+            bs,length,freq,channels = x.shape[0],x.shape[1],x.shape[2],x.shape[3]
             x = x.permute(0,2,1) # shape: [bs,len,channels]
+        
         
         x = self.mha(x, x, x, need_weights=False)[0]
         
         if self.use_2d:
-            x = x.reshape(bs,len,freq,channels).permute(0,3,2,1)
+            x = x.reshape(bs,length,freq,channels).permute(0,3,2,1)
         else:
             x = x.permute(0,2,1)
         x = x+inp
 
         return x
+    
+class CachedAttention(nn.Module):
+    def __init__(self, dim, heads=4, normalize=True, use_2d=False):
+        super(Attention, self).__init__()
+        
+        self.normalize = normalize
+        self.use_2d = use_2d
+        
+        print("using use_2D", use_2d)
+        self.dim = dim
+        self.heads = heads
 
+        self.mha = MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=0.0, add_zero_attn=False, batch_first=True)
+        
+        if normalize:
+            self.norm = CachedGroupNorm(min(dim // 4, 32), dim)
+        else:
+            self.norm = nn.Identity()
+
+        self.initialized = False
+        self.register_buffer("kv_cache", None)
+        self.register_buffer("cache_len", None)
+        
+    @torch.no_grad()
+    def init_cache(self, x):
+        """Initialize cache buffers."""
+        b, c, t = x.shape
+        self.cache_len = t
+        self.kv_cache = torch.zeros((1, t, self.dim), dtype=x.dtype, device=x.device)
+        self.initialized = True
+        print("Registering cache for attention layer : ", self.cache_len)
+        
+    def forward(self, x):
+        inp = x
+
+        if self.normalize:
+            x = self.norm(x)
+
+        if self.use_2d:
+            # 2D mode: skip cache
+            x = x.permute(0, 3, 2, 1)  # [bs, len, freq, channels]
+            bs, length, freq, channels = x.shape
+            x = x.reshape(bs * length, freq, channels)  # [bs*len, freq, channels]
+            x = self.mha(x, x, x, need_weights=False)[0]
+            x = x.reshape(bs, length, freq, channels).permute(0, 3, 2, 1)
+            return x + inp
+
+        # 1D mode with caching
+        bs, c, t = x.shape
+        x = x.permute(0, 2, 1)  # [B, T, C]
+
+        if not self.initialized:
+            self.init_cache(x.permute(0, 2, 1))  # x originally [B, C, T]
+
+        # Prepare new kv by appending to cached kv
+        new_kv = torch.cat([self.kv_cache[:bs], x], dim=1)
+        if new_kv.shape[1] > self.cache_len:
+            new_kv = new_kv[:, -self.cache_len:]  # Truncate
+
+        # Update cache
+        self.kv_cache[:bs] = new_kv
+
+        q = x#[:, -1:, :]  # Only attend to most recent timestep
+        k = v = new_kv  # Cached keys and values
+
+        out = self.mha(q, k, v, need_weights=False)[0]  # Output shape: [B, 1, C]
+        out = out.permute(0, 2, 1)  # [B, C, 1]
+
+        # Expand back to input length (match residual shape)
+        # out = out.expand(-1, -1, t)
+        return out + inp
 
 
 class ResBlock(nn.Module):
@@ -194,32 +277,49 @@ class ResBlock(nn.Module):
         self.normalize_residual = normalize_residual
         self.use_2d = use_2d
         if use_2d:
-            Conv = nn.Conv2d
+            Conv =CachedConv2d
+            self.conv1 = Conv(in_channels, out_channels, kernel_size=kernel_size, stride=1, padding_vert = "same", padding_time = cc.get_padding(kernel_size = kernel_size, stride=1, mode = hparams.conv_mode))
+            self.conv2 = zero_init(Conv(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding_vert = "same", padding_time = cc.get_padding(kernel_size = kernel_size, stride=1, mode = hparams.conv_mode)))
         else:
-            Conv = nn.Conv1d
-        self.conv1 = Conv(in_channels, out_channels, kernel_size=kernel_size, stride=1, padding='same')
-        self.conv2 = zero_init(Conv(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding='same'))
+            Conv = cc.Conv1d
+            self.conv1 = Conv(in_channels, out_channels, kernel_size=kernel_size, stride=1, padding = cc.get_padding(kernel_size = kernel_size, stride=1, mode = hparams.conv_mode))
+            self.conv2 = zero_init(Conv(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding =  cc.get_padding(kernel_size = kernel_size, stride=1, mode = hparams.conv_mode)))
+            
+        
         if in_channels!=out_channels:
             self.res_conv = Conv(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
         else:
             self.res_conv = nn.Identity()
         if normalize:
-            self.norm1 = nn.GroupNorm(min(in_channels//4, 32), in_channels)
-            self.norm2 = nn.GroupNorm(min(out_channels//4, 32), out_channels)
+            self.norm1 = CachedGroupNorm(min(in_channels//4, 32), in_channels)
+            self.norm2 = CachedGroupNorm(min(out_channels//4, 32), out_channels)
+        else:
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
         if leaky:
             self.activation = nn.LeakyReLU(negative_slope=0.2)
         else:
             self.activation = nn.SiLU()
+            
         if cond_channels is not None:
             self.proj_emb = zero_init(nn.Linear(cond_channels, out_channels))
+        else:
+            self.proj_emb = nn.Identity()
         self.dropout = nn.Dropout(hparams.dropout_rate)
         if attention:
-            self.att = Attention(out_channels, heads, use_2d=use_2d)
+            self.att = Attention(out_channels, heads, use_2d=use_2d, normalize = hparams.normalization)
+        else:
+            self.att = nn.Identity()
+            
+            
+        self.min_res_dropout = hparams.min_res_dropout
             
 
-    def forward(self, x, time_emb=None):
-        if not self.normalize_residual:
-            y = x.clone()
+    def forward(self, x, time_emb: Optional[torch.Tensor]=None):
+        #if not self.normalize_residual:
+        
+        y = x.clone()
+        
         if self.normalize:
             x = self.norm1(x)
         if self.normalize_residual:
@@ -248,15 +348,21 @@ class ResBlock(nn.Module):
         if self.normalize:
             x = self.norm2(x)
         x = self.activation(x)
-        if x.shape[-1]<=hparams.min_res_dropout:
+        if x.shape[-1]<=self.min_res_dropout:
             x = self.dropout(x)
         x = self.conv2(x)
         y = self.res_conv(y)
+        
         x = x+y
-        if self.attention:
-            x = self.att(x)
+        #if self.attention:
+        x = self.att(x)
         return x
 
+
+@torch.jit.interface
+class ModuleInterface(torch.nn.Module):
+    def forward(self, x: torch.Tensor, time_emb: Optional[torch.Tensor]= None) -> torch.Tensor: # `input` has a same name in Sequential forward
+        pass
 
 # adapted from https://github.com/yang-song/score_sde_pytorch/blob/main/models/layerspp.py
 class GaussianFourierProjection(torch.nn.Module):
@@ -294,13 +400,14 @@ class Encoder(nn.Module):
         self.layers_list = layers_list
         self.multipliers_list = hparams.multipliers_list
         input_channels = hparams.base_channels*hparams.multipliers_list[0]
-        Conv = nn.Conv2d
+        Conv = CachedConv2d
         self.gain = FreqGain(freq_dim=hparams.hop*2)
 
         channels = hparams.data_channels
-        self.conv_inp = Conv(channels, input_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_inp = Conv(channels, input_channels, kernel_size=3, stride=1, padding_vert = "same", padding_time = cc.get_padding(kernel_size = 3, stride=1, mode = hparams.conv_mode))
 
         self.freq_dim = (hparams.hop*2)//(4**hparams.freq_downsample_list.count(1))
+        self.freq_dim = self.freq_dim//(2**hparams.freq_downsample_list.count(2))
         self.freq_dim = self.freq_dim//(2**hparams.freq_downsample_list.count(0))
         
         # DOWNSAMPLING
@@ -311,61 +418,69 @@ class Encoder(nn.Module):
                 down_layers.append(ResBlock(input_channels, output_channels, normalize=hparams.normalization, attention=attention_list[i]==1, heads=hparams.heads, use_2d=True))
                 input_channels = output_channels
             if i!=(len(layers_list)-1):
-                if hparams.freq_downsample_list[i]==1:
-                    down_layers.append(DownsampleFreqConv(input_channels, normalize=hparams.pre_normalize_downsampling_encoder))
+                if hparams.freq_downsample_list[i]>1:
+                    down_layers.append(DownsampleFreqConv(input_channels, normalize=hparams.pre_normalize_downsampling_encoder, stride=4 if hparams.freq_downsample_list[i]==1 else 2))
                 else:
                     down_layers.append(DownsampleConv(input_channels, use_2d=True, normalize=hparams.pre_normalize_downsampling_encoder))
 
         if hparams.pre_normalize_2d_to_1d:
-            self.prenorm_1d_to_2d = nn.GroupNorm(min(input_channels//4, 32), input_channels)
+            self.prenorm_1d_to_2d = CachedGroupNorm(min(input_channels//4, 32), input_channels)
+        else:
+            self.prenorm_1d_to_2d = nn.Identity()
 
         bottleneck_layers = []
         output_channels = hparams.bottleneck_base_channels
-        bottleneck_layers.append(nn.Conv1d(input_channels*self.freq_dim, output_channels, kernel_size=1, stride=1, padding='same'))
+        bottleneck_layers.append(nn.Conv1d(input_channels*self.freq_dim, output_channels, kernel_size=1, stride=1, padding=0))
         for i in range(hparams.num_bottleneck_layers):
             bottleneck_layers.append(ResBlock(output_channels, output_channels, normalize=hparams.normalization, use_2d=False))
         self.bottleneck_layers = nn.ModuleList(bottleneck_layers)
 
-        self.norm_out = nn.GroupNorm(min(output_channels//4, 32), output_channels)
+        self.norm_out = CachedGroupNorm(min(output_channels//4, 32), output_channels) if hparams.normalization else nn.Identity()
         self.activation_out = nn.SiLU()
-        self.conv_out = nn.Conv1d(output_channels, hparams.bottleneck_channels, kernel_size=1, stride=1, padding='same')
+        self.conv_out = nn.Conv1d(output_channels, hparams.bottleneck_channels, kernel_size=1, stride=1, padding=0)
         self.activation_bottleneck = nn.Tanh()
             
         self.down_layers = nn.ModuleList(down_layers)
+        self.frequency_scaling = hparams.frequency_scaling
+        self.pre_normalize_2d_to_1d = hparams.pre_normalize_2d_to_1d
 
-
-    def forward(self, x, extract_features=False):
+    def forward(self, x, extract_features: bool =False)-> torch.Tensor:
 
         x = self.conv_inp(x)
-        if hparams.frequency_scaling:
+        if self.frequency_scaling:
             x = self.gain(x)
         
         # DOWNSAMPLING
         k = 0
         for i,num_layers in enumerate(self.layers_list):
             for num in range(num_layers):
-                x = self.down_layers[k](x)
+                layer: ModuleInterface = self.down_layers[k]
+                x = layer.forward(x, time_emb = None)
                 k = k+1
             if i!=(len(self.layers_list)-1):
-                x = self.down_layers[k](x)
+                layer: ModuleInterface = self.down_layers[k]
+                x = layer.forward(x, time_emb = None)
+                #x = self.down_layers[k](x)
                 k = k+1
 
-        if hparams.pre_normalize_2d_to_1d:
+        if self.pre_normalize_2d_to_1d:
             x = self.prenorm_1d_to_2d(x)
 
         x = x.reshape(x.size(0), x.size(1) * x.size(2), x.size(3))
         if extract_features:
             return x
+        else:
+            
+            
+            for layer in self.bottleneck_layers:
+                x = layer(x)
+                    
+            x = self.norm_out(x)
+            x = self.activation_out(x)
+            x = self.conv_out(x)
+            x = self.activation_bottleneck(x)
 
-        for layer in self.bottleneck_layers:
-            x = layer(x)
-                
-        x = self.norm_out(x)
-        x = self.activation_out(x)
-        x = self.conv_out(x)
-        x = self.activation_bottleneck(x)
-
-        return x
+            return x
     
 
 class Decoder(nn.Module):
@@ -379,9 +494,11 @@ class Decoder(nn.Module):
         input_channels = hparams.base_channels*hparams.multipliers_list[-1]
 
         output_channels = hparams.bottleneck_base_channels
-        self.conv_inp = nn.Conv1d(hparams.bottleneck_channels, output_channels, kernel_size=1, stride=1, padding='same')
+        self.conv_inp = nn.Conv1d(hparams.bottleneck_channels, output_channels, kernel_size=1, stride=1, padding="same")
+        
         
         self.freq_dim = (hparams.hop*2)//(4**hparams.freq_downsample_list.count(1))
+        self.freq_dim = (hparams.hop*2)//(2**hparams.freq_downsample_list.count(2))
         self.freq_dim = self.freq_dim//(2**hparams.freq_downsample_list.count(0))
 
         bottleneck_layers = []
@@ -400,8 +517,8 @@ class Decoder(nn.Module):
                 up_layers.append(ResBlock(input_channels, input_channels, normalize=hparams.normalization, attention=list(reversed(attention_list))[i]==1, heads=hparams.heads, use_2d=True))
             if i!=(len(layers_list)-1):
                 output_channels = hparams.base_channels*multiplier
-                if freq_upsample_list[i]==1:
-                    up_layers.append(UpsampleFreqConv(input_channels, output_channels))
+                if freq_upsample_list[i]>1:
+                    up_layers.append(UpsampleFreqConv(input_channels, output_channels, stride=4 if freq_upsample_list[i]==1 else 2))
                 else:
                     up_layers.append(UpsampleConv(input_channels, output_channels, use_2d=True))
                 input_channels = output_channels
@@ -423,13 +540,17 @@ class Decoder(nn.Module):
         # UPSAMPLING
         k = 0
         pyramid_list = []
-        for i,num_layers in enumerate(reversed(self.layers_list)):
+        for i,num_layers in enumerate(self.layers_list[::-1]):
             for num in range(num_layers):
-                x = self.up_layers[k](x)
+                # x = self.up_layers[k](x)
+                uplayer: ModuleInterface = self.up_layers[k]
+                x = uplayer.forward(x, time_emb = None)
                 k = k+1
             pyramid_list.append(x)
             if i!=(len(self.layers_list)-1):
-                x = self.up_layers[k](x)
+                # x = self.up_layers[k](x)
+                uplayer: ModuleInterface = self.up_layers[k]
+                x = uplayer.forward(x, time_emb = None)
                 k = k+1
 
         pyramid_list = pyramid_list[::-1]
@@ -437,14 +558,26 @@ class Decoder(nn.Module):
         return pyramid_list
 
 
+
+class ConvWrap(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(ConvWrap, self).__init__()
+        self.conv = CachedConv2d(*args, **kwargs)
+    def forward(self, x: torch.Tensor, time_emb: Optional[torch.Tensor]):
+        return self.conv.forward(x)
+        
 class UNet(nn.Module):
     def __init__(self):
         super(UNet, self).__init__()
         
+        
+        
+        print("Using conv mode: ", hparams.conv_mode)
+        
         self.layers_list = hparams.layers_list
         self.multipliers_list = hparams.multipliers_list
         input_channels = hparams.base_channels*hparams.multipliers_list[0]
-        Conv = nn.Conv2d
+        Conv = ConvWrap
 
         self.encoder = Encoder()
         self.decoder = Decoder()
@@ -459,7 +592,7 @@ class UNet(nn.Module):
         self.scale_inp = nn.Sequential(nn.Linear(hparams.cond_channels, hparams.cond_channels), nn.SiLU(), nn.Linear(hparams.cond_channels, hparams.cond_channels), nn.SiLU(), zero_init(nn.Linear(hparams.cond_channels, hparams.hop*2)))
         self.scale_out = nn.Sequential(nn.Linear(hparams.cond_channels, hparams.cond_channels), nn.SiLU(), nn.Linear(hparams.cond_channels, hparams.cond_channels), nn.SiLU(), zero_init(nn.Linear(hparams.cond_channels, hparams.hop*2)))
 
-        self.conv_inp = Conv(hparams.data_channels, input_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_inp = CachedConv2d(hparams.data_channels, input_channels, kernel_size=3, stride=1, padding_vert = "same", padding_time = cc.get_padding(kernel_size = 3, stride=1, mode = hparams.conv_mode))
         
         # DOWNSAMPLING
         down_layers = []
@@ -471,8 +604,8 @@ class UNet(nn.Module):
                 input_channels = output_channels
             if i!=(len(hparams.layers_list)-1):
                 output_channels = hparams.base_channels*hparams.multipliers_list[i+1]
-                if hparams.freq_downsample_list[i]==1:
-                    down_layers.append(DownsampleFreqConv(input_channels, output_channels))
+                if hparams.freq_downsample_list[i]>1:
+                    down_layers.append(DownsampleFreqConv(input_channels, output_channels, stride=4 if hparams.freq_downsample_list[i]==1 else 2))
                 else:
                     down_layers.append(DownsampleConv(input_channels, output_channels, use_2d=True))
 
@@ -486,25 +619,30 @@ class UNet(nn.Module):
                 up_layers.append(ResBlock(input_channels, input_channels, hparams.cond_channels, normalize=hparams.normalization, attention=list(reversed(hparams.attention_list))[i]==1, heads=hparams.heads, use_2d=True))
             if i!=(len(hparams.layers_list)-1):
                 output_channels = hparams.base_channels*multiplier
-                if freq_upsample_list[i]==1:
-                    up_layers.append(UpsampleFreqConv(input_channels, output_channels))
+                if freq_upsample_list[i]>1:
+                    up_layers.append(UpsampleFreqConv(input_channels, output_channels, stride = 4 if freq_upsample_list[i]==1 else 2))
                 else:
                     up_layers.append(UpsampleConv(input_channels, output_channels, use_2d=True))
                 input_channels = output_channels
                 
-        self.conv_decoded = Conv(input_channels, input_channels, kernel_size=1, stride=1, padding=0)
-        self.norm_out = nn.GroupNorm(min(input_channels//4, 32), input_channels)
+        self.conv_decoded = CachedConv2d(input_channels, input_channels, kernel_size=1, stride=1, padding=0)
+        self.norm_out = CachedGroupNorm(min(input_channels//4, 32), input_channels)
         self.activation_out = nn.SiLU()
-        self.conv_out = zero_init(Conv(input_channels, hparams.data_channels, kernel_size=3, stride=1, padding=1))
+        self.conv_out = zero_init(CachedConv2d(input_channels, hparams.data_channels, kernel_size=3, stride=1, padding_vert = "same", padding_time = cc.get_padding(kernel_size = 3, stride=1, mode = hparams.conv_mode)))
             
         self.down_layers = nn.ModuleList(down_layers)
         self.up_layers = nn.ModuleList(up_layers)
+        
+        self.sigma_min = hparams.sigma_min
+        self.sigma_data = hparams.sigma_data
+        self.frequency_scaling = hparams.frequency_scaling
+        self.sigma_max = hparams.sigma_max
 
 
-    def forward_generator(self, latents, x, sigma: float =None, pyramid_latents=None):
+    def forward_generator(self, latents, x, sigma:Optional[float] =None, pyramid_latents: Optional[List[torch.Tensor]] = None) :
 
         if sigma is None:
-            sigma = hparams.sigma_max
+            sigma = self.sigma_max
         
         inp = x
         
@@ -517,7 +655,7 @@ class UNet(nn.Module):
         scale_w_inp = self.scale_inp(emb_sigma_log).reshape(x.shape[0],1,-1,1)
         scale_w_out = self.scale_out(emb_sigma_log).reshape(x.shape[0],1,-1,1)
             
-        c_skip, c_out, c_in = get_c(sigma, sigma_data = hparams.sigma_data, sigma_min = hparams.sigma_min)
+        c_skip, c_out, c_in = get_c(sigma, sigma_min = self.sigma_min, sigma_data = self.sigma_data)
         
         x = c_in*x
 
@@ -528,7 +666,7 @@ class UNet(nn.Module):
             pyramid_latents = self.decoder(latents)
 
         x = self.conv_inp(x)
-        if hparams.frequency_scaling:
+        if self.frequency_scaling:
             x = (1.+scale_w_inp)*x
         
         skip_list = []
@@ -538,35 +676,46 @@ class UNet(nn.Module):
         r = 0
         for i,num_layers in enumerate(self.layers_list):
             for num in range(num_layers):
-                d = self.down_layers[k](pyramid_latents[i])
+                # d = self.down_layers[k](pyramid_latents[i])
+                layer: ModuleInterface = self.down_layers[k]
+                d = layer.forward(pyramid_latents[i], time_emb = None)
+                
+                
                 k = k+1
-                x = (x+d)/np.sqrt(2.)
-                x = self.down_layers[k](x, time_emb)
+                x = (x+d)/(torch.sqrt(torch.tensor(2.)))
+                # x = self.down_layers[k](x, time_emb)
+                layer: ModuleInterface = self.down_layers[k]
+                x = layer.forward(x, time_emb)
                 skip_list.append(x)
                 k = k+1
             if i!=(len(self.layers_list)-1):
-                x = self.down_layers[k](x)
+                layer: ModuleInterface = self.down_layers[k]
+                x = layer.forward(x, time_emb = None)
+                # x = self.down_layers[k](x)
                 k = k+1
               
         # UPSAMPLING
         k = 0
-        for i,num_layers in enumerate(reversed(self.layers_list)):
+        for i,num_layers in enumerate(self.layers_list[::-1]):
             for num in range(num_layers):
-                d = self.up_layers[k](pyramid_latents[-i-1])
+                layer: ModuleInterface = self.up_layers[k]
+                d = layer.forward(pyramid_latents[-i-1], time_emb = None)
                 k = k+1
-                x = (x+skip_list.pop()+d)/np.sqrt(3.)
-                x = self.up_layers[k](x, time_emb)
+                x = (x+skip_list.pop()+d)/(torch.sqrt(torch.tensor(3.)))
+                layer: ModuleInterface = self.up_layers[k]
+                x = layer.forward(x, time_emb)
                 k = k+1
             if i!=(len(self.layers_list)-1):
-                x = self.up_layers[k](x)
+                layer: ModuleInterface = self.up_layers[k]
+                x = layer.forward(x, time_emb=None)
                 k = k+1
                 
         d = self.conv_decoded(pyramid_latents[0])
-        x = (x+d)/np.sqrt(2.)
+        x = (x+d)/(torch.sqrt(torch.tensor(2.)))
 
         x = self.norm_out(x)
         x = self.activation_out(x)
-        if hparams.frequency_scaling:
+        if self.frequency_scaling:
             x = (1.+scale_w_out)*x
         x = self.conv_out(x)
 

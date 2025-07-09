@@ -1,7 +1,7 @@
 from .fad import FrechetAudioDistance
 from .hparams import hparams
 
-def compute_fad(fad_path):
+def compute_fad(true_path, target_path):
     scores = []
     for i,model_name in enumerate(hparams.fad_models):
 
@@ -25,8 +25,8 @@ def compute_fad(fad_path):
             raise NameError('Must be (vggish, clap)')
 
         score = frechet.score(
-            hparams.data_path_test,
-            fad_path,
+            true_path,
+            target_path,
             background_embds_path=hparams.fad_background_embeddings[i],
             dtype="float32")
         scores.append(score)

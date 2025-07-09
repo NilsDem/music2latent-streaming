@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from huggingface_hub import hf_hub_download
 import torch
+from typing import List
 
 from .hparams import hparams
 from .audio import *
@@ -17,11 +18,11 @@ from .audio import *
 # sigma: noise level
 # Returns:
 # c_skip, c_out, c_in: scaling coefficients
-def get_c(sigma):
-    sigma_correct = hparams.sigma_min
-    c_skip = (hparams.sigma_data**2.)/(((sigma-sigma_correct)**2.) + (hparams.sigma_data**2.))
-    c_out = (hparams.sigma_data*(sigma-sigma_correct))/(((hparams.sigma_data**2.) + (sigma**2.))**0.5)
-    c_in = 1./(((sigma**2.)+(hparams.sigma_data**2.))**0.5)
+def get_c(sigma: torch.Tensor, sigma_data: float, sigma_min: float) -> List[torch.Tensor]:
+    sigma_correct = sigma_min
+    c_skip = (sigma_data**2.)/(((sigma-sigma_correct)**2.) + (sigma_data**2.))
+    c_out = (sigma_data*(sigma-sigma_correct))/(((sigma_data**2.) + (sigma**2.))**0.5)
+    c_in = 1./(((sigma**2.)+(sigma_data**2.))**0.5)
     return c_skip.reshape(-1,1,1,1), c_out.reshape(-1,1,1,1), c_in.reshape(-1,1,1,1)
 
 # Get noise level sigma_i based on index i and number of discretization steps k
@@ -30,8 +31,8 @@ def get_c(sigma):
 # k: number of discretization steps
 # Returns:
 # sigma_i: noise level corresponding to index i
-def get_sigma(i, k):
-    return (hparams.sigma_min**(1./hparams.rho) + ((i-1)/(k-1))*(hparams.sigma_max**(1./hparams.rho)-hparams.sigma_min**(1./hparams.rho)))**hparams.rho
+def get_sigma(i, k, sigma_min, sigma_max):
+    return (sigma_min**(1./hparams.rho) + ((i-1)/(k-1))*(sigma_max**(1./hparams.rho)-sigma_min**(1./hparams.rho)))**hparams.rho
 
 # Get noise level sigma for a continuous index i in [0, 1]
 # Follows parameterization in https://openreview.net/pdf?id=FmqFfMTNnv
@@ -39,8 +40,8 @@ def get_sigma(i, k):
 # i: continuous index in [0, 1]
 # Returns:
 # sigma: corresponding noise level
-def get_sigma_continuous(i):
-    return (hparams.sigma_min**(1./hparams.rho) + i*(hparams.sigma_max**(1./hparams.rho)-hparams.sigma_min**(1./hparams.rho)))**hparams.rho
+def get_sigma_continuous(i, sigma_min, sigma_max):
+    return (sigma_min**(1./hparams.rho) + i*(sigma_max**(1./hparams.rho)-sigma_min**(1./hparams.rho)))**hparams.rho
 
 
 # Get noise level sigma_{i-step} where i is a continuous index in (0, 1]
@@ -49,8 +50,8 @@ def get_sigma_continuous(i):
 # step: step to be taken towards lower sigma
 # Returns:
 # sigma_{i-step}: noise level corresponding to i-step
-def get_sigma_step_continuous(sigma_i, step):
-    return ((sigma_i**(1./hparams.rho) - step*(hparams.sigma_max**(1./hparams.rho)-hparams.sigma_min**(1./hparams.rho)))**hparams.rho).clamp(min=hparams.sigma_min)
+def get_sigma_step_continuous(sigma_i, step, sigma_min, sigma_max):
+    return ((sigma_i**(1./hparams.rho) - step*(sigma_max**(1./hparams.rho)-sigma_min**(1./hparams.rho)))**hparams.rho).clamp(min=sigma_min)
 
 # Add Gaussian noise to input x based on given noise and sigma
 # Parameters:
@@ -96,7 +97,7 @@ def get_step_schedule(k):
 # Returns:
 # weights: sampling weights
 def get_sampling_weights(k, device='cuda'):
-    sigma = get_sigma(torch.linspace(1, k-1, k-1, dtype=torch.int32, device=device), k)
+    sigma = get_sigma(torch.linspace(1, k-1, k-1, dtype=torch.int32, device=device), k, hparams.sigma_min,hparams.sigma_max)
     return gaussian_pdf(torch.log(sigma))
 
 # Get stepped index for continuous sampling
@@ -116,8 +117,8 @@ def get_step_continuous(inds, step):
 #   sigma: noise level
 # Returns:
 #   x: x after reversing ODE by one step
-def reverse_step(x, noise, sigma):
-    return x + ((sigma**2 - hparams.sigma_min**2)**0.5)*noise
+def reverse_step(x, noise, sigma, sigma_min):
+    return x + ((sigma**2 - sigma_min**2)**0.5)*noise
 
 # Gaussian probability density function, used to sample noise levels with lognormal distribution
 # Parameters:
@@ -160,15 +161,15 @@ def reverse_diffusion(model, initial_noise, diffusion_steps, latents=None):
     for k in range(diffusion_steps):
 
         # Get sigma values
-        sigma = get_sigma(diffusion_steps+1-k, diffusion_steps+1)
-        next_sigma = get_sigma(diffusion_steps-k, diffusion_steps+1)
+        sigma = get_sigma(diffusion_steps+1-k, diffusion_steps+1,hparams.sigma_min,hparams.sigma_max)
+        next_sigma = get_sigma(diffusion_steps-k, diffusion_steps+1,hparams.sigma_min,hparams.sigma_max)
 
         # Denoise 
         noisy_samples = next_noisy_samples
         pred_noises, pred_samples = denoise(model, noisy_samples, sigma, latents)
 
         # Step to next (lower) noise level
-        next_noisy_samples = reverse_step(pred_samples, pred_noises, next_sigma)
+        next_noisy_samples = reverse_step(pred_samples, pred_noises, next_sigma, sigma_min = hparams.sigma_min)
 
     return pred_samples.detach().cpu()
 
@@ -179,7 +180,7 @@ def reverse_diffusion(model, initial_noise, diffusion_steps, latents=None):
 #   diffusion_steps: number of steps
 # Returns:
 #   generated_images: final generated samples
-def generate(model, num_samples=9, diffusion_steps=3, seconds=None, latents=None):
+def generate(model, num_samples=9, diffusion_steps=3, seconds=None, latents=None, transform = None):
     if seconds is None:
         sample_length = hparams.data_length
     else:
@@ -191,7 +192,7 @@ def generate(model, num_samples=9, diffusion_steps=3, seconds=None, latents=None
         sample_length = int(latents.shape[-1]*downscaling_factor)
     initial_noise = torch.randn((num_samples, hparams.data_channels, hparams.hop*2, sample_length)).cuda()*hparams.sigma_max
     generated_images = reverse_diffusion(model, initial_noise, diffusion_steps, latents=latents)
-    return to_waveform(generated_images)
+    return to_waveform(generated_images, transform = transform)
 
 # Encode and Decode samples with consistency model
 # Parameters:
@@ -201,18 +202,23 @@ def generate(model, num_samples=9, diffusion_steps=3, seconds=None, latents=None
 # Returns:
 #   generated_samples: final generated samples
 @torch.no_grad()
-def encode_decode(model, dataset, num_samples=9, diffusion_steps=1):
+def encode_decode(model, dataset, num_samples=9, diffusion_steps=1, transform=None, max_size = None):
     device = next(model.parameters()).device
     from torch.utils.data import DataLoader
     dataloader = DataLoader(dataset, batch_size=1, drop_last=True, shuffle=True, num_workers=0)
     real = []
     fake = []
-    for x in tqdm(islice(dataloader, num_samples)):
-        repr_encoder = to_representation_encoder(x.to(device))
+    for i, x in enumerate(tqdm(dataloader)):
+        x = x["waveform"]
+        if max_size is not None:
+            x = x[...,:max_size]
+        repr_encoder = to_representation_encoder(x.to(device), transform = transform)
         latent = model.encoder(repr_encoder)
-        generated_samples = generate(model, diffusion_steps=diffusion_steps, latents=latent)
+        generated_samples = generate(model, diffusion_steps=diffusion_steps, latents=latent, transform = transform)
         real.append(x.squeeze(0).cpu())
         fake.append(generated_samples.squeeze(0).cpu())
+        if i>num_samples:
+            break
     return real, fake
 
 # Generate a batch of samples by splitting into multiple mini-batches that fit in GPU memory
@@ -242,19 +248,23 @@ def generate_batch(model, num_samples, max_batch_size=1024, diffusion_steps=1):
 # Returns:
 #   samples: generated samples
 @torch.no_grad()
-def encode_decode_batch(model, dataset, num_samples, diffusion_steps=1):
+def encode_decode_batch(model, dataloader, num_samples, diffusion_steps=1, transform = None, max_size = None):
     device = next(model.parameters()).device
-    from torch.utils.data import DataLoader
-    dataloader = DataLoader(dataset, batch_size=1, drop_last=True, shuffle=False, num_workers=0)
     print(f'Generating {num_samples} samples...')
     generated_batches = []
-    batches = num_samples
+    batches = num_samples//dataloader.batch_size
     print(f'Generating {num_samples} samples in {batches} batches...')
-    for x in tqdm(islice(dataloader, batches+1)):
-        repr_encoder = to_representation_encoder(x.to(device))
+    
+    for i, x in enumerate(tqdm(dataloader)):
+        if max_size is not None:
+            x = x[...,:max_size]
+        repr_encoder = to_representation_encoder(x.to(device), transform = transform)
         latents = model.encoder(repr_encoder)
-        generated_samples = generate(model, diffusion_steps=diffusion_steps, latents=latents)
+        generated_samples = generate(model, diffusion_steps=diffusion_steps, latents=latents, transform = transform)
         generated_batches.append(generated_samples.squeeze(0).cpu())
+        
+        if i>batches:
+            break
     return generated_batches
 
 # Encode audio sample
@@ -265,14 +275,14 @@ def encode_decode_batch(model, dataset, num_samples, diffusion_steps=1):
 # Returns:
 #   latent: compressed latent representation with shape [audio_channels, dim, latent_length]
 @torch.no_grad()
-def encode_audio(audio_path, trainer, device='cuda', return_input=False):
+def encode_audio(audio_path, trainer, device='cuda', return_input=False, transform = None):
     trainer.gen = trainer.gen.to(device)
     trainer.gen.eval()
     downscaling_factor = 2**hparams.freq_downsample_list.count(0)
     audio_original, sr = sf.read(audio_path, dtype='float32', always_2d=True)
     audio = np.transpose(audio_original, [1,0]) # [audio_channels, audio_length]
     audio = torch.from_numpy(audio).to(device)
-    repr_encoder = to_representation_encoder(audio)
+    repr_encoder = to_representation_encoder(audio, transform = transform)
     sample_length = repr_encoder.shape[-1]
     # crop sample to be compatiblen with downscaling factor
     repr_encoder = repr_encoder[:,:,:,:(sample_length//downscaling_factor)*downscaling_factor]

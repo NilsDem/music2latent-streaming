@@ -48,14 +48,32 @@ def realimag2wv(x, hop_size=256, fac=4):
     X = denormalize_complex(X)
     return istft(X, fac=fac, hop_size=hop_size, device=X.device).clamp(-1.,1.)
 
-def to_representation_encoder(x):
-    return wv2realimag(x, hparams.hop)
 
-def to_representation(x):
-    return wv2realimag(x, hparams.hop)
 
-def to_waveform(x):
-    return realimag2wv(x, hparams.hop)
+
+def to_representation_encoder(x, transform = None):
+    if transform is None:
+        x = wv2realimag(x, hparams.hop)
+        return x
+    with torch.no_grad():
+        x= transform.forward(x.unsqueeze(1))
+        x = x[..., :2**int(np.log2(x.shape[-1]))]
+        return x
+
+def to_representation(x, transform = None):
+    if transform is None:
+        x = wv2realimag(x, hparams.hop)
+        return x
+    with torch.no_grad():
+        x = transform.forward(x.unsqueeze(1))
+        x = x[..., :2**int(np.log2(x.shape[-1]))]
+        return x
+
+def to_waveform(x, transform = None):
+    if transform is None:
+        return realimag2wv(x, hparams.hop)
+    with torch.no_grad():
+        return transform.inverse(x.to(transform.device)).squeeze(1).cpu()
 
 def overlap_and_add(signal, frame_step):
 

@@ -14,7 +14,11 @@ from . import misc
 from .ema import ExponentialMovingAverage
 from .hparams import hparams
 from .utils import *
-from .models import *
+
+if hparams.streaming == True:
+    from .models_stream import *
+else:
+    from .models import * 
 from .data import *
 from .audio import *
 
@@ -28,7 +32,7 @@ from torch.distributed import destroy_process_group
 
 
 class Trainer:
-    def __init__(self):
+    def __init__(self, config_file):
         if hparams.multi_gpu:
             torch.multiprocessing.set_start_method('spawn')
             misc.init()
@@ -38,15 +42,20 @@ class Trainer:
         # set self.device to cuda if it is available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        from .transforms import StreamableSTFT
+        self.transform = StreamableSTFT(nfft = hparams.hop*4, hop_size = hparams.hop, skip_features = 1, alpha_rescale=hparams.alpha_rescale, beta_rescale=hparams.beta_rescale).to(self.device)
+        
         batch_size_per_gpu = hparams.batch_size // misc.get_world_size()
 
         self.save_path = None
         self.dl = get_dataloader(batch_size_per_gpu)
         if misc.get_rank()==0:
-            self.ds_test = get_test_dataset()
+            self.ds_test, self.dl_test = get_test_dataset(batch_size= 8)
         self.get_models()
         self.switch_save_checkpoint = True
         self.step = 0
+        
+        
         
         # INITIALIZE CHECKPOINT FOLDER
         if misc.get_rank()==0:
@@ -56,6 +65,10 @@ class Trainer:
                 os.makedirs(os.path.join(self.save_path, 'code'), exist_ok=True)
                 for file in glob.glob(os.path.dirname(__file__) + '/*.py'):
                     shutil.copyfile(file, self.save_path+'/code/'+os.path.basename(file))
+                    
+                shutil.copyfile(config_file, os.path.join(self.save_path, "config.py"))
+                    
+                
             self.writer = SummaryWriter(log_dir=self.save_path)
 
 
@@ -76,8 +89,9 @@ class Trainer:
 
     def train_it(self, wv):
 
-        data = to_representation(wv)
-        data_encoder = to_representation_encoder(wv)
+        data = to_representation(wv, transform = self.transform)
+        data_encoder = to_representation_encoder(wv, transform = self.transform)
+
 
         step = get_step_schedule(min(self.it,hparams.total_iters))
         self.step = step
@@ -90,9 +104,9 @@ class Trainer:
         else:
             inds = torch.rand((data.shape[0],), dtype=torch.float32, device=data.device)
             
-        sigmas = get_sigma_continuous(inds)
+        sigmas = get_sigma_continuous(inds,hparams.sigma_min, hparams.sigma_max)
         inds_step = get_step_continuous(inds, step)
-        sigmas_step = get_sigma_continuous(inds_step)
+        sigmas_step = get_sigma_continuous(inds_step,hparams.sigma_min, hparams.sigma_max)
         
         noises = torch.randn_like(data)
         noisy_samples = add_noise(data, noises, sigmas_step)
@@ -124,7 +138,10 @@ class Trainer:
 
         self.gen.train()
         g = 0
-
+        print("Testing model")
+        self.test_model()
+        print("Computing FAD")
+        self.calculate_fad(hparams.inference_diffusion_steps)
         while self.it<hparams.total_iters:
             if hparams.multi_gpu:
                 self.dl.sampler.set_epoch(self.epoch)
@@ -151,9 +168,13 @@ class Trainer:
                 if batchi%100==0 and misc.get_rank()==0:
                     pbar.set_postfix({'loss': np.mean(loss_list[-g:], axis=0)})
             
+      
             self.epoch = self.epoch + 1
             if misc.get_rank()==0:
-                self.calculate_fad(hparams.inference_diffusion_steps)
+                try:
+                    self.calculate_fad(hparams.inference_diffusion_steps)
+                except:
+                    pass
                 self.save_checkpoint(np.mean(loss_list[-g:]))
                 if hparams.enable_ema:
                     with self.ema.average_parameters():
@@ -190,25 +211,41 @@ class Trainer:
         self.gen.eval()
         max_steps = hparams.inference_diffusion_steps
 
-        num_examples = 4
-        original,reconstructed = encode_decode(self.gen, self.ds_test, num_examples)
+        num_examples = 300
+        original,reconstructed = encode_decode(self.gen, self.ds_test, num_examples, transform = self.transform, max_size = hparams.hop * hparams.data_length)
+        self.save_audios_to_wav(original, "true_samples")
+        self.save_audios_to_wav(reconstructed, "generated_samples")
+        
         if len(original[0].shape)==2:
             original = [el[0,:] for el in original]
         if len(reconstructed[0].shape)==2:
             reconstructed = [el[0,:] for el in reconstructed]
-        fig = plot_audio_compare(original,reconstructed)
+        fig = plot_audio_compare(original[:4],reconstructed[:4])
         fig.suptitle(f'{max_steps} steps')
         if self.writer is not None:
-            for ind in range(num_examples):
+            for ind in range(4):
                 self.writer.add_audio(f"original_{ind}", original[ind].detach().cpu().squeeze().numpy(), global_step=self.it, sample_rate=hparams.sample_rate)
                 self.writer.add_audio(f"reconstructed_{ind}", reconstructed[ind].detach().cpu().squeeze().numpy(), global_step=self.it, sample_rate=hparams.sample_rate)
             self.writer.add_figure(f"figs/{max_steps}_steps", fig, global_step=self.it)
         plt.close()
         self.gen.train()
-
-    def save_batch_to_wav(self, batch):
+        
+    def save_audios_to_wav(self, batch, type):
         print('Saving audio samples...')
-        self.final_fad_path = os.path.join(self.save_path, hparams.eval_samples_path)
+        self.final_fad_path = os.path.join(self.save_path, type)
+        os.makedirs(self.final_fad_path, exist_ok=True)
+        for i, audio in enumerate(batch):
+            audio_data = audio.squeeze().numpy()
+            if len(audio_data.shape)==2:
+                audio_data = audio_data[0]
+            audio_data = (audio_data * 32767.0).astype(np.int16)  # Scale to 16-bit PCM range
+            audio_file_path = os.path.join(self.final_fad_path, f'audio_{i}.wav')
+            # Save the audio file
+            write(audio_file_path, hparams.sample_rate, audio_data)
+
+    def save_batch_to_wav(self, batch, type):
+        print('Saving audio samples...')
+        self.final_fad_path = os.path.join(self.save_path, type)
         os.makedirs(self.final_fad_path, exist_ok=True)
         for i in range(len(batch)):
             audio_data = batch[i].numpy()
@@ -220,17 +257,19 @@ class Trainer:
             write(audio_file_path, hparams.sample_rate, audio_data)
             
     def calculate_fad(self, diffusion_steps=1, log=True):
-        if hparams.enable_ema:
-            with self.ema.average_parameters():
-                self.gen.eval()
-                samples = encode_decode_batch(self.gen, self.ds_test, hparams.num_samples_fad, diffusion_steps=diffusion_steps)
-                self.gen.train()
-        else:
-            self.gen.eval()
-            samples = encode_decode_batch(self.gen, self.ds_test, hparams.num_samples_fad, diffusion_steps=diffusion_steps)
-            self.gen.train()
-        self.save_batch_to_wav(samples)
-        score = fad_utils.compute_fad(self.final_fad_path)
+        # if hparams.enable_ema:
+        #     with self.ema.average_parameters():
+        #         self.gen.eval()
+        #         samples = encode_decode_batch(self.gen, self.dl_test, hparams.num_samples_fad, diffusion_steps=diffusion_steps, transform = self.transform)
+        #         self.gen.train()
+        # else:
+        #     self.gen.eval()
+        #     samples = encode_decode_batch(self.gen, self.dl_test, hparams.num_samples_fad, diffusion_steps=diffusion_steps, transform = self.transform)
+        #     self.gen.train()
+        # self.save_batch_to_wav(samples)
+        
+        score = fad_utils.compute_fad(os.path.join(self.save_path, "true_samples"), os.path.join(self.save_path, "generated_samples"))
+        print("FAAAAAAAAAAAaaaaa")
         print(f'FAD: {score}')
         if log:
             for i in range(len(hparams.fad_models)):
@@ -349,8 +388,8 @@ class Trainer:
 
 
 
-def main():
-    trainer = Trainer()
+def main(config_file):
+    trainer = Trainer(config_file = config_file)
     trainer.train()
     if hparams.multi_gpu:
         destroy_process_group()

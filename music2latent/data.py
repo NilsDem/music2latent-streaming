@@ -4,6 +4,7 @@ import os
 import soundfile as sf
 import random
 from tqdm import tqdm
+import numpy as np
 
 from .hparams import hparams
 
@@ -12,7 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 class TestAudioDataset(Dataset):
     def __init__(self, wav_path, hop, fac, data_length, tot_samples=None, random_sampling=True):
         self.random_sampling = random_sampling
-        self.paths = find_files_with_extensions(wav_path, extensions=['.wav', '.flac'])
+        self.paths = find_files_with_extensions(wav_path, extensions=['.wav', '.flac', '.mp3'])
         # sort paths
         self.paths = sorted(self.paths)
         seed_value = 42
@@ -103,7 +104,7 @@ class AudioDataset(Dataset):
 
         self.hop = hop
         self.data_length = data_length
-        self.wv_length = hop * data_length + (fac-1)*hop
+        self.wv_length = hop * data_length #+ (fac-1)*hop
         self.data_fractions = torch.tensor(data_fractions)
 
     def __len__(self):
@@ -121,8 +122,15 @@ class AudioDataset(Dataset):
             samplerate = info.samplerate
             duration = info.duration
             length = int(samplerate*duration)
-            rand_start = torch.randint(length-self.wv_length, size=(1,)).item()
-            wv,_ = sf.read(path, frames=self.wv_length, start=rand_start, stop=None, dtype='float32', always_2d=True)
+            if length>self.wv_length//4 and length<self.wv_length:
+                wv,_ = sf.read(path, frames=-1, start=0, stop=None, dtype='float32', always_2d=True)
+                while wv.shape[0]<self.wv_length:
+                    wv = np.concatenate((wv, wv), axis = 0)
+                wv = wv[:self.wv_length]
+            else:
+                rand_start = torch.randint(length-self.wv_length, size=(1,)).item()
+                wv,_ = sf.read(path, frames=self.wv_length, start=rand_start, stop=None, dtype='float32', always_2d=True)
+            
             wv = torch.from_numpy(wv)
             if wv.shape[-1]==1:
                 wv = torch.cat([wv,wv], dim=1)
@@ -144,15 +152,48 @@ class AudioDataset(Dataset):
         return wv
 
 
+def collate_fn(x):
+    x = [l["waveform"] for l in x]
+    # x = [
+    #     l[..., i0:i0 + num_signal] for l, i0 in zip(
+    #         x, torch.randint(x[0].shape[-1] - num_signal, (len(x), )))
+    # ]
+    
+    audio_length = hparams.hop * hparams.data_length 
+
+    for i in range(len(x)):
+        x[i] = x[i].reshape(1, -1)
+        i0 = np.random.randint(0, x[i].shape[-1] - audio_length)
+        x[i] = x[i][..., i0:i0 + audio_length]
+
+    x = np.stack(x)
+    x = torch.from_numpy(x).reshape(x.shape[0], -1).float()
+    return x
+
+
 def get_dataloader(batch_size_per_gpu):
     
-    dataset = AudioDataset(hparams.data_paths, hparams.hop, 4, hparams.data_length, hparams.data_fractions, hparams.rms_min, hparams.data_extensions, hparams.iters_per_epoch*hparams.batch_size)
-    
-    if hparams.multi_gpu:
-        return DataLoader(dataset, batch_size=batch_size_per_gpu, drop_last=True, shuffle=False, sampler=DistributedSampler(dataset), num_workers=hparams.num_workers, pin_memory=True)
+    if hparams.db_paths is None:
+        dataset = AudioDataset(hparams.data_paths, hparams.hop, 4, hparams.data_length, hparams.data_fractions, hparams.rms_min, hparams.data_extensions, hparams.iters_per_epoch*hparams.batch_size)
     else:
-        return DataLoader(dataset, batch_size=batch_size_per_gpu, drop_last=True, shuffle=True, num_workers=hparams.num_workers, pin_memory=True)
+        from after.dataset import CombinedDataset
+        print("using after dataset")
+        dataset = CombinedDataset(path_dict= {p:{"path":p} for p in hparams.db_paths}, freqs = "estimate", freqs_parameter = 0.5, config = "train")
+        
+    if hparams.multi_gpu:
+        return DataLoader(dataset, batch_size=batch_size_per_gpu, drop_last=True, shuffle=False, sampler=DistributedSampler(dataset), num_workers=hparams.num_workers, pin_memory=True, collate_fn = collate_fn if hparams.db_paths is not None else None)
+    else:
+        return DataLoader(dataset, batch_size=batch_size_per_gpu, drop_last=True, shuffle=False if  hparams.db_paths is not None else True, num_workers=hparams.num_workers, pin_memory=True, collate_fn = collate_fn if hparams.db_paths is not None else None, sampler=dataset.get_sampler() if hparams.db_paths is not None else None)
 
 
-def get_test_dataset():
-    return TestAudioDataset(hparams.data_path_test, hparams.hop, 4, hparams.data_length)
+def get_test_dataset(batch_size):
+    if hparams.db_paths is not None:
+        from after.dataset import CombinedDataset
+        print("using after dataset")
+        dataset = CombinedDataset(path_dict= {p:{"path":p} for p in hparams.db_paths}, freqs = "estimate", freqs_parameter = 0.5, config = "validation")
+        dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=True, shuffle=False if  hparams.db_paths is not None else True, num_workers=hparams.num_workers, pin_memory=True, collate_fn = collate_fn, sampler=dataset.get_sampler() if hparams.db_paths is not None else None)
+    else:
+        dataset = TestAudioDataset(hparams.data_path_test, hparams.hop, 4, hparams.data_length)
+        dataloader=  DataLoader(dataset, batch_size=batch_size, drop_last=True, shuffle=False if hparams.db_paths is not None else True, num_workers=hparams.num_workers, pin_memory=True)
+        
+    return dataset, dataloader

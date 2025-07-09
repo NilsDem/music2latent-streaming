@@ -6,12 +6,12 @@ from .ema import ExponentialMovingAverage
 from .hparams import hparams
 from .hparams_inference import *
 from .utils import *
-from .models import *
+from .models_stream import *
 from .audio import *
 
 
 class EncoderDecoder:
-    def __init__(self, load_path_inference=None, device=None):
+    def __init__(self, load_path_inference=None, device=None, transform = None):
         download_model()
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -21,6 +21,8 @@ class EncoderDecoder:
         if load_path_inference is None:
             self.load_path_inference = load_path_inference_default
         self.get_models()
+
+        self.transform = transform
         
     def get_models(self):
         gen = UNet().to(self.device)
@@ -32,8 +34,9 @@ class EncoderDecoder:
             ema.load_state_dict(checkpoint['ema_state_dict'])
             ema.copy_to()
             with ema.average_parameters():
-                checkpoint['gen_state_dict'] = self.gen.state_dict()
-        gen.load_state_dict(checkpoint['gen_state_dict'], strict=False)
+                checkpoint['gen_state_dict'] = gen.state_dict()
+        gen.load_state_dict(checkpoint['gen_state_dict'], strict=True)
+        # self.gen = torch.jit.script(gen)
         self.gen = gen
 
     def encode(self, path_or_audio, max_waveform_length=None, max_batch_size=None, extract_features=False):
@@ -50,7 +53,7 @@ class EncoderDecoder:
             max_waveform_length = max_waveform_length_encode
         if max_batch_size is None:
             max_batch_size = max_batch_size_encode
-        return encode_audio_inference(path_or_audio, self, max_waveform_length, max_batch_size, device=self.device, extract_features=extract_features)
+        return encode_audio_inference(path_or_audio, self, max_waveform_length, max_batch_size, device=self.device, extract_features=extract_features, transform = self.transform)
     
     def decode(self, latent, denoising_steps=1, max_waveform_length=None, max_batch_size=None):
         '''
@@ -65,7 +68,7 @@ class EncoderDecoder:
             max_waveform_length = max_waveform_length_decode
         if max_batch_size is None: 
             max_batch_size = max_batch_size_decode
-        return decode_latent_inference(latent, self, max_waveform_length, max_batch_size, diffusion_steps=denoising_steps, device=self.device)
+        return decode_latent_inference(latent, self, max_waveform_length, max_batch_size, diffusion_steps=denoising_steps, device=self.device, transform = self.transform)
 
 
 
@@ -98,7 +101,7 @@ def decode_to_representation(model, latents, diffusion_steps=1, device='cuda'):
 # Returns:
 #   latent: compressed latent representation with shape [audio_channels, dim, latent_length]
 @torch.no_grad()
-def encode_audio_inference(audio_path, trainer, max_waveform_length_encode, max_batch_size_encode, device='cuda', extract_features=False):
+def encode_audio_inference(audio_path, trainer, max_waveform_length_encode, max_batch_size_encode, device='cuda', extract_features=False, transform = None):
     trainer.gen = trainer.gen.to(device)
     trainer.gen.eval()
     downscaling_factor = 2**hparams.freq_downsample_list.count(0)
@@ -126,7 +129,7 @@ def encode_audio_inference(audio_path, trainer, max_waveform_length_encode, max_
     cropped_length = ((((audio.shape[-1]-3*hparams.hop)//hparams.hop)//downscaling_factor)*hparams.hop*downscaling_factor)+3*hparams.hop
     audio = audio[:,:cropped_length]
 
-    repr_encoder = to_representation_encoder(audio)
+    repr_encoder = to_representation_encoder(audio, transform = transform)
     sample_length = repr_encoder.shape[-1]
     max_sample_length = (int(max_waveform_length_encode/hparams.hop)//downscaling_factor)*downscaling_factor
 
@@ -174,7 +177,7 @@ def encode_audio_inference(audio_path, trainer, max_waveform_length_encode, max_
 # Returns:
 #   audio: numpy array of decoded waveform with shape [waveform_samples, audio_channels]
 @torch.no_grad()
-def decode_latent_inference(latent, trainer, max_waveform_length_decode, max_batch_size_decode, diffusion_steps=1, device='cuda'):
+def decode_latent_inference(latent, trainer, max_waveform_length_decode, max_batch_size_decode, diffusion_steps=1, device='cuda', transform = None):
     trainer.gen = trainer.gen.to(device)
     trainer.gen.eval()
     downscaling_factor = 2**hparams.freq_downsample_list.count(0)
@@ -218,4 +221,4 @@ def decode_latent_inference(latent, trainer, max_waveform_length_decode, max_bat
         repr_ls = torch.split(repr, audio_channels, 0)
         repr = torch.cat(repr_ls, -1)
     repr = repr[:,:,:,:repr.shape[-1]-(pad_size*downscaling_factor)]
-    return to_waveform(repr)
+    return to_waveform(repr, transform = transform)

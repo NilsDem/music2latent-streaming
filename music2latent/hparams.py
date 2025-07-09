@@ -36,7 +36,8 @@ class HParams:
 
     # DATA
     data_path_test: str = field(init=False)                                         # path of samples used for FAD testing (e.g. musiccaps)
-    data_paths: List[str] = field(init=False)                                       # list of paths of datasets
+    data_paths: Optional[List[str]] = None                                   # list of paths of datasets
+    db_paths: Optional[List[str]] = None
     data_fractions: Optional[List[float]] = None                                    # list of sampling weights of each dataset (if None, equal sampling weights)
     data_extensions: List[str] = field(default_factory=lambda: ['.wav', '.flac'])   # list of extensions of audio files to search for in the given paths
     rms_min: float = 0.001                                                          # minimum RMS value for audio samples used for training
@@ -58,7 +59,8 @@ class HParams:
     fad_background_embeddings: List[str] = field(default_factory=lambda: [f'fad_stats/test_data_fad_embeddings_{fm}.npy' for fm in ['vggish', 'clap']])    # name of FAD embeddings file. If does not exist, it will be created on the first run
 
     # MODEL
-    base_channels: int = 64                                                         # base channel number for architecture
+    streaming: bool = False
+    base_channels: int = 64                                                       # base channel number for architecture
     layers_list: List[int] = field(default_factory=lambda: [2, 2, 2, 2, 2])         # number of blocks per each resolution level
     multipliers_list: List[int] = field(default_factory=lambda: [1, 2, 4, 4, 4])    # base channels multipliers for each resolution level
     attention_list: List[int] = field(default_factory=lambda: [0, 0, 1, 1, 1])      # for each resolution, 0 if no attention is performed, 1 if attention is performed
@@ -90,7 +92,12 @@ class HParams:
     rho: float = 7.0                                                                # rho parameter for EDM framework
     use_lognormal: bool = True                                                      # use a lognormal noise schedule during training
     p_mean: float = -1.1                                                            # mean of lognormal noise schedule
-    p_std: float = 2.0                                                              # standard deviation of lognormal noise schedule
+    p_std: float = 2.0     
+    
+    conv_mode = None    
+    
+    
+    # standard deviation of lognormal noise schedule
 
     def update(self, config_dict: dict):
         # make sure I can set each key as an attribute (e.g. I can call hparams.batch_size)
