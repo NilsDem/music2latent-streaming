@@ -209,7 +209,7 @@ def encode_decode(model, dataset, num_samples=9, diffusion_steps=1, transform=No
     real = []
     fake = []
     for i, x in enumerate(tqdm(dataloader)):
-        x = x["waveform"]
+        x = x
         if max_size is not None:
             x = x[...,:max_size]
         repr_encoder = to_representation_encoder(x.to(device), transform = transform)
